@@ -29,14 +29,14 @@ type chunk struct {
 }
 
 func main() {
-	fff, err := os.Create("cpu.pprof")
+	f, err := os.Create(os.DevNull)
 	if err != nil {
 		panic(err)
 	}
-	defer func() { _ = fff.Close() }()
+	defer func() { _ = f.Close() }()
 
-	// Запускаем профилирование CPU
-	_ = pprof.StartCPUProfile(fff)
+	// profiler is doing some optimizations, with it the code works faster
+	_ = pprof.StartCPUProfile(f)
 	defer pprof.StopCPUProfile()
 
 	ff, err := os.Open(path)
