@@ -5,6 +5,8 @@ import (
 	"github.com/dolthub/swiss"
 	"io"
 	"os"
+	"runtime/pprof"
+	"slices"
 	"strconv"
 	"sync"
 )
@@ -14,6 +16,8 @@ const (
 	bufferSize = 2048 * 2048
 	workersNum = 25
 )
+
+var lockIdx = 0
 
 type Temperatures struct {
 	Station string
@@ -27,23 +31,23 @@ func NewTemperatures(min, mean, max float64, cnt int, station string) *Temperatu
 	return &Temperatures{Min: min, Mean: mean, Max: max, Cnt: cnt, Station: station}
 }
 
-type incompleteLine struct {
-	p       []byte // data
-	n       int    // chunk number
-	isFirst bool   // is first line? if not, then it's mean that it's the last
+type IncompleteLine struct {
+	Idx     int
+	Value   []byte
+	Initial bool
 }
 
 func main() {
-	//pprofFile, err := os.Create("cpu.pprof")
-	//if err != nil {
-	//	panic(err)
-	//}
+	pprofFile, err := os.Create("cpu.pprof")
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = pprofFile.Close() }()
+
+	//pprofFile, _ := os.Open(os.DevNull)
 	//defer func() { _ = pprofFile.Close() }()
-	//
-	////pprofFile, _ := os.Open(os.DevNull)
-	////defer func() { _ = pprofFile.Close() }()
-	//_ = pprof.StartCPUProfile(pprofFile)
-	//defer pprof.StopCPUProfile()
+	_ = pprof.StartCPUProfile(pprofFile)
+	defer pprof.StopCPUProfile()
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -52,14 +56,16 @@ func main() {
 	defer func() { _ = f.Close() }()
 
 	mu := new(sync.Mutex)
-	wg := &sync.WaitGroup{}
-
-	resultMap := swiss.NewMap[uint64, *Temperatures](500)
-
-	incompleteLinesCh := make(chan incompleteLine, workersNum-2)
-	go processIncompleteLine(incompleteLinesCh, resultMap)
 
 	resCh := make(chan *swiss.Map[uint64, *Temperatures], workersNum)
+	resultMap := swiss.NewMap[uint64, *Temperatures](500)
+
+	wg := &sync.WaitGroup{}
+
+	incompleteLinesCh := make(chan *IncompleteLine, 1024)
+	wg.Add(1)
+	go trashBin(incompleteLinesCh, resCh, wg)
+
 	wg.Add(1)
 	go processChunks(wg, mu, resCh, incompleteLinesCh)
 
@@ -75,10 +81,9 @@ func processChunks(
 	mwg *sync.WaitGroup,
 	mu *sync.Mutex,
 	resMapsCh chan<- *swiss.Map[uint64, *Temperatures],
-	incompleteLinesCh chan<- incompleteLine,
+	incompleteLinesCh chan<- *IncompleteLine,
 ) {
 	defer func() {
-		close(resMapsCh)
 		close(incompleteLinesCh)
 		mwg.Done()
 	}()
@@ -92,48 +97,43 @@ func processChunks(
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
 
-	for chunk := 0; chunk < workersNum; chunk++ {
+	for worker := 0; worker < workersNum; worker++ {
 		wg.Add(1)
-		go func(chunk int) {
+		go func(worker int) {
 			defer wg.Done()
 
 			resMap := swiss.NewMap[uint64, *Temperatures](100)
 
+			chunk := 1
 			buffer := make([]byte, bufferSize)
 			for {
 				mu.Lock()
-				_, err = f.Read(buffer)
+				lockIdx++
+				idx := lockIdx
+				_, rerr := f.Read(buffer)
 				mu.Unlock()
-				if err != nil {
-					if err == io.EOF {
+				if rerr != nil {
+					if rerr == io.EOF {
 						break
 					} else {
-						panic(err)
+						panic(rerr)
 					}
 				}
 
-				// skip the last incomplete line and pass it to appropriate handler
-				lastCorrectIdx := len(buffer)
-				if chunk != 0 {
-					lastCorrectIdx = bytes.LastIndexByte(buffer, '\n') + 1
-					incompleteLinesCh <- incompleteLine{
-						p:       buffer[lastCorrectIdx:],
-						n:       chunk,
-						isFirst: false,
-					}
+				firstIdx := bytes.IndexByte(buffer, '\n')
+				incompleteLinesCh <- &IncompleteLine{
+					Idx:     idx - 1,
+					Value:   buffer[:firstIdx],
+					Initial: false,
+				}
+				lastIdx := bytes.LastIndexByte(buffer, '\n')
+				incompleteLinesCh <- &IncompleteLine{
+					Idx:     idx,
+					Value:   buffer[lastIdx+1:],
+					Initial: true,
 				}
 
-				firstCorrectIdx := 0
-				if chunk != workersNum-1 {
-					firstCorrectIdx = bytes.IndexByte(buffer, '\n')
-					incompleteLinesCh <- incompleteLine{
-						p:       buffer[:firstCorrectIdx],
-						n:       chunk,
-						isFirst: true,
-					}
-				}
-
-				buffer = buffer[firstCorrectIdx:lastCorrectIdx]
+				buffer = buffer[firstIdx+1 : lastIdx]
 
 				s := 0
 				for i := 0; i < len(buffer); i++ {
@@ -148,7 +148,6 @@ func processChunks(
 						}
 
 						h := hash(station)
-
 						temps, found := resMap.Get(h)
 						if !found {
 							resMap.Put(h, NewTemperatures(temperature, temperature, temperature, 1, string(station)))
@@ -166,16 +165,111 @@ func processChunks(
 						s = i + 1
 					}
 				}
+
+				chunk++
 			}
 
 			resMapsCh <- resMap
-		}(chunk)
+		}(worker)
 	}
 }
 
-func processIncompleteLine(incompleteLinesCh <-chan incompleteLine, resultsMap *swiss.Map[uint64, *Temperatures]) {
-	for _ = range incompleteLinesCh {
-		//fmt.Printf("data: %v, n: %d, isFirst: %v \n", string(line.p), line.n, line.isFirst)
+func trashBin(input chan *IncompleteLine, output chan *swiss.Map[uint64, *Temperatures], wg *sync.WaitGroup) {
+	defer func() {
+		close(output)
+		wg.Done()
+	}()
+	data := swiss.NewMap[uint64, *Temperatures](1024)
+
+	can := []*IncompleteLine{}
+	buffer := make([]byte, 1024)
+
+	for item := range input {
+		can = append(can, item)
+		can = saveCan(can, data, buffer)
+	}
+
+	output <- data
+}
+
+func saveCan(can []*IncompleteLine, data *swiss.Map[uint64, *Temperatures], buffer []byte) []*IncompleteLine {
+	for i, ref := range can {
+		if ref.Idx == 0 {
+			_, nameInit, nameEnd, tempInit, tempEnd := nextLine(0, ref.Value)
+			processLine(ref.Value[nameInit:nameEnd], ref.Value[tempInit:tempEnd], data)
+			return slices.Delete(can, i, i+1)
+		}
+
+		for j, oth := range can {
+			if ref.Idx == oth.Idx && i != j {
+				if ref.Initial {
+					copy(buffer[:len(ref.Value)], ref.Value)
+					copy(buffer[len(ref.Value):], oth.Value)
+				} else {
+					copy(buffer[:len(oth.Value)], oth.Value)
+					copy(buffer[len(oth.Value):], ref.Value)
+				}
+				total := len(ref.Value) + len(oth.Value)
+
+				end, nameInit, nameEnd, tempInit, tempEnd := nextLine(0, buffer)
+				processLine(buffer[nameInit:nameEnd], buffer[tempInit:tempEnd], data)
+
+				if end < total {
+					_, nameInit, nameEnd, tempInit, tempEnd := nextLine(end, buffer)
+					processLine(buffer[nameInit:nameEnd], buffer[tempInit:tempEnd], data)
+				}
+
+				if i > j {
+					can = slices.Delete(can, i, i+1)
+					can = slices.Delete(can, j, j+1)
+				} else {
+					can = slices.Delete(can, j, j+1)
+					can = slices.Delete(can, i, i+1)
+				}
+
+				return can
+			}
+		}
+	}
+
+	return can
+}
+
+func nextLine(readingIndex int, reading []byte) (nexReadingIndex, nameInit, nameEnd, tempInit, tempEnd int) {
+	i := readingIndex
+	nameInit = readingIndex
+	for reading[i] != 59 { // ;
+		i++
+	}
+	nameEnd = i
+
+	i++ // skip ;
+
+	tempInit = i
+	for i < len(reading) && reading[i] != 10 { // \n
+		i++
+	}
+	tempEnd = i
+
+	readingIndex = i + 1
+	return readingIndex, nameInit, nameEnd, tempInit, tempEnd
+}
+
+func processLine(name, temperature []byte, data *swiss.Map[uint64, *Temperatures]) {
+	temp := parseFloat(temperature)
+	id := hash(name)
+	station, ok := data.Get(id)
+	if !ok {
+		data.Put(id, &Temperatures{string(name), 1, temp, temp, 1})
+	} else {
+		if temp < station.Min {
+			station.Min = temp
+		}
+		if temp > station.Max {
+			station.Max = temp
+		}
+		station.Mean += temp
+		station.Cnt++
 	}
 }
 
