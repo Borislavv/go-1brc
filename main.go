@@ -282,7 +282,7 @@ func aggregateResults(wg *sync.WaitGroup, resultsCh <-chan *swiss.Map[uint64, *T
 			if !found {
 				resultsMap.Put(h, NewTemperatures(stat.Min, stat.Mean, stat.Max, 1, stat.Station))
 			} else {
-				temps.Cnt++
+				temps.Cnt += stat.Cnt
 				temps.Mean += stat.Mean
 
 				if stat.Min < temps.Min {
