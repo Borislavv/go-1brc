@@ -181,7 +181,7 @@ func trashBin(input chan *IncompleteLine, output chan *swiss.Map[uint64, *Temper
 	}()
 	data := swiss.NewMap[uint64, *Temperatures](1024)
 
-	can := []*IncompleteLine{}
+	var can []*IncompleteLine
 	buffer := make([]byte, 1024)
 
 	for item := range input {
