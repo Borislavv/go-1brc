@@ -14,7 +14,7 @@ import (
 const (
 	filePath   = "/Users/admin/projects/rust/1brc-rust/measurements.txt"
 	bufferSize = 2048 * 2048
-	workersNum = 25
+	workersNum = 24
 )
 
 var lockIdx = 0
