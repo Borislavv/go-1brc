@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bytes"
+	"fmt"
 	"github.com/dolthub/swiss"
-	"io"
 	"os"
 	"runtime/pprof"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"syscall"
 )
 
 const (
@@ -18,6 +19,7 @@ const (
 )
 
 var lockIdx = 0
+var offset atomic.Int64
 
 type Temperatures struct {
 	Station string
@@ -74,7 +76,7 @@ func main() {
 
 	wg.Wait()
 
-	printResult(resultMap)
+	//printResult(resultMap)
 }
 
 func processChunks(
@@ -88,11 +90,20 @@ func processChunks(
 		mwg.Done()
 	}()
 
-	f, err := os.Open(filePath)
+	fd, err := syscall.Open(filePath, syscall.O_RDONLY, 0)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Error opening file: %v\n", err)
+		os.Exit(1)
 	}
-	defer func() { _ = f.Close() }()
+	defer syscall.Close(fd)
+
+	//var stat syscall.Stat_t
+	//err = syscall.Fstat(fd, &stat)
+	//if err != nil {
+	//	panic(err)
+	//}
+
+	//chunksize := stat.Size / workersNum
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
@@ -102,50 +113,67 @@ func processChunks(
 		go func(worker int) {
 			defer wg.Done()
 
-			resMap := swiss.NewMap[uint64, *Temperatures](100)
+			fdd, derr := syscall.Open(filePath, syscall.O_RDONLY, 0)
+			if derr != nil {
+				fmt.Printf("Error opening file: %v\n", derr)
+				os.Exit(1)
+			}
+			defer syscall.Close(fdd)
 
-			chunk := 1
+			resMap := swiss.NewMap[uint64, *Temperatures](100)
+			
 			buffer := make([]byte, bufferSize)
 			for {
-				mu.Lock()
-				lockIdx++
-				idx := lockIdx
-				_, rerr := f.Read(buffer)
-				mu.Unlock()
-				if rerr != nil {
-					if rerr == io.EOF {
+				//mu.Lock()
+				//lockIdx++
+				//idx := lockIdx
+				//mu.Unlock()
+
+				var off int64
+				for {
+					off = offset.Load()
+					if offset.CompareAndSwap(off, off+bufferSize) {
 						break
-					} else {
-						panic(rerr)
 					}
 				}
-
-				firstIdx := bytes.IndexByte(buffer, '\n')
-				incompleteLinesCh <- &IncompleteLine{
-					Idx:     idx - 1,
-					Value:   buffer[:firstIdx],
-					Initial: false,
+				n, rerr := syscall.Pread(fdd, buffer, off)
+				if rerr != nil {
+					panic(rerr)
 				}
-				lastIdx := bytes.LastIndexByte(buffer, '\n')
-				incompleteLinesCh <- &IncompleteLine{
-					Idx:     idx,
-					Value:   buffer[lastIdx+1:],
-					Initial: true,
+				if n == 0 {
+					break
+				}
+				if n < bufferSize {
+					buffer = buffer[:n]
 				}
 
-				buffer = buffer[firstIdx+1 : lastIdx]
+				//firstIdx := bytes.IndexByte(buffer, '\n')
+				//incompleteLinesCh <- &IncompleteLine{
+				//	Idx:     int(idx) - 1,
+				//	Value:   buffer[:firstIdx],
+				//	Initial: false,
+				//}
+				//lastIdx := bytes.LastIndexByte(buffer, '\n')
+				//incompleteLinesCh <- &IncompleteLine{
+				//	Idx:     int(idx),
+				//	Value:   buffer[lastIdx+1:],
+				//	Initial: true,
+				//}
 
-				s := 0
-				for i := 0; i < len(buffer); i++ {
-					if buffer[i] == '\n' {
-						var station []byte
-						temperature := 0.00
-						for j := 0; j < len(buffer[s:i]); j++ {
-							if buffer[s:i][j] == ';' {
-								station = buffer[s:i][:j]
-								temperature = parseFloat(buffer[s:i][j+1:])
-							}
-						}
+				//buffer = buffer[firstIdx+1 : lastIdx]
+
+				statTo := 0
+				stationTo := 0
+				lineFrom := 0
+				chunkLen := len(buffer)
+				for lineTo := 0; lineTo < chunkLen; lineTo++ {
+					if buffer[lineTo] == ';' {
+						stationTo = lineTo
+						statTo = lineTo + 1
+					} else if buffer[lineTo] == '\n' {
+						station := buffer[lineFrom:stationTo]
+						temperature := parseFloat(buffer[statTo:])
+						lineFrom = lineTo + 1
 
 						h := hash(station)
 						temps, found := resMap.Get(h)
@@ -161,12 +189,8 @@ func processChunks(
 								temps.Max = temperature
 							}
 						}
-
-						s = i + 1
 					}
 				}
-
-				chunk++
 			}
 
 			resMapsCh <- resMap
